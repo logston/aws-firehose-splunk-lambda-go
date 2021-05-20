@@ -252,21 +252,84 @@ func (rrl *ResultRecordList) projectedSize() int {
 func putRecordsToFirehoseStream(
 	svc *firehose.Firehose,
 	streamName string,
-	rrl ResultRecordList,
+	records []*firehose.Record,
 	attempt int,
 	maxAttempts int,
 ) error {
+	var failed []*firehose.PutRecordBatchResponseEntry
 
+	out, err := svc.PutRecordBatch(&firehose.PutRecordBatchInput{
+		DeliveryStreamName: &streamName,
+		Records:            records,
+	})
+
+	if err != nil {
+		failed = out.RequestResponses
+	} else if *out.FailedPutCount != 0 {
+		codes := []string{}
+		for _, r := range out.RequestResponses {
+			r := r
+			if *r.ErrorCode != "" {
+				codes = append(codes, *r.ErrorCode)
+				failed = append(failed, r)
+			}
+		}
+		err = fmt.Errorf("Individual error codes: %s\n", strings.Join(codes, ","))
+	}
+
+	if len(failed) > 0 {
+		if attempt+1 < maxAttempts {
+			fmt.Printf("Some records failed while calling PutRecordBatch, retrying. %s\n", err)
+			if err = putRecordsToFirehoseStream(svc, streamName, records, attempt+1, 20); err != nil {
+				return err
+			}
+		} else {
+			return fmt.Errorf("Could not put records after %d attempts. %s", maxAttempts, err)
+		}
+	}
+
+	return nil
 }
 
 func putRecordsToKinesisStream(
 	svc *kinesis.Kinesis,
 	streamName string,
-	rrl ResultRecordList,
+	records []*kinesis.PutRecordsRequestEntry,
 	attempt int,
 	maxAttempts int,
 ) error {
+	var failed []*kinesis.PutRecordsResultEntry
 
+	out, err := svc.PutRecords(&kinesis.PutRecordsInput{
+		StreamName: &streamName,
+		Records:    records,
+	})
+	if err != nil {
+		failed = out.Records
+	} else if *out.FailedRecordCount != 0 {
+		codes := []string{}
+		for _, r := range out.Records {
+			r := r
+			if *r.ErrorCode != "" {
+				codes = append(codes, *r.ErrorCode)
+				failed = append(failed, r)
+			}
+		}
+		err = fmt.Errorf("Individual error codes: %s\n", strings.Join(codes, ","))
+	}
+
+	if len(failed) > 0 {
+		if attempt+1 < maxAttempts {
+			fmt.Printf("Some records failed while calling PutRecords, retrying. %s\n", err)
+			if err = putRecordsToKinesisStream(svc, streamName, records, attempt+1, 20); err != nil {
+				return err
+			}
+		} else {
+			return fmt.Errorf("Could not put records after %d attempts. %s", maxAttempts, err)
+		}
+	}
+
+	return nil
 }
 
 func HandleRequest(ctx context.Context, e Event) (ResultResponse, error) {
@@ -317,11 +380,27 @@ func HandleRequest(ctx context.Context, e Event) (ResultResponse, error) {
 			batch := putRecordBatches[idx]
 			if e.isSas() {
 				svc := kinesis.New(sess, aws.NewConfig().WithRegion(e.Region))
-				err := putRecordsToKinesisStream(svc, e.streamName(), batch, 0, 20)
-
+				svcRecords := []*kinesis.PutRecordsRequestEntry{}
+				for _, r := range batch {
+					svcRecords = append(svcRecords, &kinesis.PutRecordsRequestEntry{
+						Data:         []byte(r.Data),
+						PartitionKey: &r.PartitionKey,
+					})
+				}
+				if err = putRecordsToKinesisStream(svc, e.streamName(), svcRecords, 0, 20); err != nil {
+					fmt.Println("Failed to reingest records.")
+					return ResultResponse{}, err
+				}
 			} else {
 				svc := firehose.New(sess, aws.NewConfig().WithRegion(e.Region))
-				err := putRecordsToFirehoseStream(svc, e.streamName(), batch, 0, 20)
+				svcRecords := []*firehose.Record{}
+				for _, r := range batch {
+					svcRecords = append(svcRecords, &firehose.Record{Data: []byte(r.Data)})
+				}
+				if err = putRecordsToFirehoseStream(svc, e.streamName(), svcRecords, 0, 20); err != nil {
+					fmt.Println("Failed to reingest records.")
+					return ResultResponse{}, err
+				}
 			}
 			recordsReingestedSoFar += len(batch)
 			fmt.Printf(

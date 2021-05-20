@@ -37,7 +37,7 @@ type EventRecord struct {
 	KinesisMetadata             KinesisRecordMetadata `json:"kinesisRecordMetadata"`
 }
 
-func (er *EventRecord) createReingestionRecord(isSas bool, partitionKey string) (ResultRecord, error) {
+func (er *EventRecord) createReingestionRecord(isSas bool) (ResultRecord, error) {
 	data, err := base64.StdEncoding.DecodeString(er.Data)
 	if err != nil {
 		return ResultRecord{}, err
@@ -48,7 +48,7 @@ func (er *EventRecord) createReingestionRecord(isSas bool, partitionKey string) 
 	}
 
 	if isSas {
-		r.PartitionKey = partitionKey
+		r.PartitionKey = er.KinesisMetadata.PartitionKey
 	}
 
 	return r, nil
@@ -83,7 +83,7 @@ func (e *Event) getInputDataByRecId() (map[string]ResultRecord, error) {
 	inputDataByRecId := map[string]ResultRecord{}
 
 	for _, r := range e.Records {
-		rr, err := r.createReingestionRecord(e.isSas(), r.KinesisMetadata.PartitionKey)
+		rr, err := r.createReingestionRecord(e.isSas())
 		if err != nil {
 			return nil, err
 		}
@@ -237,7 +237,7 @@ func transformRecords(e Event) ResultRecordList {
 
 type ResultRecordList []ResultRecord
 
-// calculateProjectedSize returns the estimated size in bytes of the payload to
+// projectedSize returns the estimated size in bytes of the payload to
 // be reingested.
 func (rrl *ResultRecordList) projectedSize() int {
 	total := 0
@@ -332,6 +332,50 @@ func putRecordsToKinesisStream(
 	return nil
 }
 
+func putBatches(e Event, batches [][]ResultRecord, totalRecordsToBeReingested int) error {
+	sess := session.Must(session.NewSession())
+
+	recordsReingestedSoFar := 0
+	for idx := 0; idx < len(batches); idx++ {
+		batch := batches[idx]
+		if e.isSas() {
+			svc := kinesis.New(sess, aws.NewConfig().WithRegion(e.Region))
+			svcRecords := []*kinesis.PutRecordsRequestEntry{}
+			for _, r := range batch {
+				svcRecords = append(svcRecords, &kinesis.PutRecordsRequestEntry{
+					Data:         []byte(r.Data),
+					PartitionKey: &r.PartitionKey,
+				})
+			}
+			if err := putRecordsToKinesisStream(svc, e.streamName(), svcRecords, 0, 20); err != nil {
+				fmt.Println("Failed to reingest records.")
+				return err
+			}
+		} else {
+			svc := firehose.New(sess, aws.NewConfig().WithRegion(e.Region))
+			svcRecords := []*firehose.Record{}
+			for _, r := range batch {
+				svcRecords = append(svcRecords, &firehose.Record{Data: []byte(r.Data)})
+			}
+			if err := putRecordsToFirehoseStream(svc, e.streamName(), svcRecords, 0, 20); err != nil {
+				fmt.Println("Failed to reingest records.")
+				return err
+			}
+		}
+		recordsReingestedSoFar += len(batch)
+		fmt.Printf(
+			"Reingested %d/%d records out of %d in to %s stream\n",
+			recordsReingestedSoFar, totalRecordsToBeReingested, len(e.Records), e.streamName(),
+		)
+	}
+	fmt.Printf(
+		"Reingested all %d records out of %d in to %s stream\n",
+		totalRecordsToBeReingested, len(e.Records), e.streamName(),
+	)
+
+	return nil
+}
+
 func HandleRequest(ctx context.Context, e Event) (ResultResponse, error) {
 	resultRecords := transformRecords(e)
 
@@ -373,45 +417,9 @@ func HandleRequest(ctx context.Context, e Event) (ResultResponse, error) {
 	}
 
 	if len(putRecordBatches) > 0 {
-		sess := session.Must(session.NewSession())
-
-		recordsReingestedSoFar := 0
-		for idx := 0; idx < len(putRecordBatches); idx++ {
-			batch := putRecordBatches[idx]
-			if e.isSas() {
-				svc := kinesis.New(sess, aws.NewConfig().WithRegion(e.Region))
-				svcRecords := []*kinesis.PutRecordsRequestEntry{}
-				for _, r := range batch {
-					svcRecords = append(svcRecords, &kinesis.PutRecordsRequestEntry{
-						Data:         []byte(r.Data),
-						PartitionKey: &r.PartitionKey,
-					})
-				}
-				if err = putRecordsToKinesisStream(svc, e.streamName(), svcRecords, 0, 20); err != nil {
-					fmt.Println("Failed to reingest records.")
-					return ResultResponse{}, err
-				}
-			} else {
-				svc := firehose.New(sess, aws.NewConfig().WithRegion(e.Region))
-				svcRecords := []*firehose.Record{}
-				for _, r := range batch {
-					svcRecords = append(svcRecords, &firehose.Record{Data: []byte(r.Data)})
-				}
-				if err = putRecordsToFirehoseStream(svc, e.streamName(), svcRecords, 0, 20); err != nil {
-					fmt.Println("Failed to reingest records.")
-					return ResultResponse{}, err
-				}
-			}
-			recordsReingestedSoFar += len(batch)
-			fmt.Printf(
-				"Reingested %d/%d records out of %d in to %s stream\n",
-				recordsReingestedSoFar, totalRecordsToBeReingested, len(e.Records), e.streamName(),
-			)
+		if err := putBatches(e, putRecordBatches, totalRecordsToBeReingested); err != nil {
+			return ResultResponse{}, err
 		}
-		fmt.Printf(
-			"Reingested all %d records out of %d in to %s stream\n",
-			totalRecordsToBeReingested, len(e.Records), e.streamName(),
-		)
 	} else {
 		fmt.Printf("No records needed to be reingested.")
 	}

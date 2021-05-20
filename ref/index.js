@@ -197,7 +197,9 @@ exports.handler = (event, context, callback) => {
         const streamARN = isSas ? event.sourceKinesisStreamArn : event.deliveryStreamArn;
         const region = streamARN.split(':')[3];
         const streamName = streamARN.split('/')[1];
+
         const result = { records: recs };
+
         let recordsToReingest = [];
         const putRecordBatches = [];
         let totalRecordsToBeReingested = 0;
@@ -207,6 +209,7 @@ exports.handler = (event, context, callback) => {
         let projectedSize = recs.filter(rec => rec.result === 'Ok')
                               .map(r => r.recordId.length + r.data.length)
                               .reduce((a, b) => a + b, 0);
+
         // 6000000 instead of 6291456 to leave ample headroom for the stuff we didn't account for
         for (let idx = 0; idx < event.records.length && projectedSize > 6000000; idx++) {
             const rec = result.records[idx];

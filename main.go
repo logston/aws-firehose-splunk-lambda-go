@@ -249,6 +249,26 @@ func (rrl *ResultRecordList) projectedSize() int {
 	return total
 }
 
+func putRecordsToFirehoseStream(
+	svc *firehose.Firehose,
+	streamName string,
+	rrl ResultRecordList,
+	attempt int,
+	maxAttempts int,
+) error {
+
+}
+
+func putRecordsToKinesisStream(
+	svc *kinesis.Kinesis,
+	streamName string,
+	rrl ResultRecordList,
+	attempt int,
+	maxAttempts int,
+) error {
+
+}
+
 func HandleRequest(ctx context.Context, e Event) (ResultResponse, error) {
 	resultRecords := transformRecords(e)
 
@@ -297,11 +317,11 @@ func HandleRequest(ctx context.Context, e Event) (ResultResponse, error) {
 			batch := putRecordBatches[idx]
 			if e.isSas() {
 				svc := kinesis.New(sess, aws.NewConfig().WithRegion(e.Region))
-				//putRecordsToKinesisStream(streamName, recordBatch, client, resolve, reject, 0, 20);
+				err := putRecordsToKinesisStream(svc, e.streamName(), batch, 0, 20)
 
 			} else {
 				svc := firehose.New(sess, aws.NewConfig().WithRegion(e.Region))
-				//putRecordsToFirehoseStream(streamName, recordBatch, client, resolve, reject, 0, 20);
+				err := putRecordsToFirehoseStream(svc, e.streamName(), batch, 0, 20)
 			}
 			recordsReingestedSoFar += len(batch)
 			fmt.Printf(
